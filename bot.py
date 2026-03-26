@@ -1,11 +1,14 @@
 import os
 import logging
+import glob
 from dotenv import load_dotenv
 import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
+from bs4 import BeautifulSoup
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -17,12 +20,70 @@ logger = logging.getLogger(__name__)
 # Инициализация Groq
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Инициализация векторной БД и эмбеддера
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_collection(name="docs")
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+# Конфигурация векторной БД и эмбеддера
+CHROMA_PATH = "./chroma_db"
+COLLECTION_NAME = "docs"
+DOCS_DIR = "documents"
 
-TOP_K = 5  # количество релевантных чанков
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", ".", " ", ""]
+)
+
+TOP_K = 5
+
+def extract_text_and_links(html_path):
+    with open(html_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f, 'html.parser')
+        for tag in soup(['script', 'style', 'comment']):
+            tag.decompose()
+        links = [a['href'] for a in soup.find_all('a', href=True)]
+        text = soup.get_text(separator='\n')
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        text = '\n'.join(lines)
+        return text, list(set(links))
+
+def ensure_collection():
+    """Проверяет существование коллекции, при отсутствии — создаёт и индексирует документы."""
+    try:
+        collection = chroma_client.get_collection(COLLECTION_NAME)
+        logger.info("Коллекция уже существует")
+        return collection
+    except chromadb.errors.InvalidCollectionException:
+        logger.info("Коллекция не найдена, начинаем индексацию...")
+        collection = chroma_client.create_collection(COLLECTION_NAME)
+
+        # Индексируем все HTML-файлы в папке documents
+        html_files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
+        if not html_files:
+            logger.warning("Папка documents пуста, индексация не выполнена")
+            return collection
+
+        for file_path in html_files:
+            logger.info(f"Индексируем {file_path}...")
+            text, links = extract_text_and_links(file_path)
+            if not text:
+                continue
+            chunks = text_splitter.split_text(text)
+            if not chunks:
+                continue
+
+            embeddings = embedder.encode(chunks).tolist()
+            file_name = os.path.basename(file_path)
+            ids = [f"{file_name}_{i}" for i in range(len(chunks))]
+            metadatas = [{"source": file_name, "links": ";".join(links)} for _ in chunks]
+
+            collection.add(
+                embeddings=embeddings,
+                documents=chunks,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logger.info(f"  Добавлено {len(chunks)} чанков, ссылок: {len(links)}")
+        return collection
 
 async def start(update, context):
     await update.message.reply_text("Привет! Я бот-помощник по документации. Задай вопрос, и я найду ответ в нашей базе знаний.")
@@ -31,10 +92,12 @@ async def handle_message(update, context):
     user_text = update.message.text
     logger.info(f"Пользователь {update.effective_user.id}: {user_text}")
 
-    # 1. Преобразуем вопрос в эмбеддинг
+    collection = ensure_collection()  # при каждом запросе проверяем, но коллекция уже существует
+
+    # Эмбеддинг вопроса
     query_embedding = embedder.encode([user_text]).tolist()[0]
 
-    # 2. Ищем похожие чанки
+    # Поиск
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=TOP_K,
@@ -45,20 +108,12 @@ async def handle_message(update, context):
         await update.message.reply_text("Извините, не нашёл информации по вашему вопросу.")
         return
 
-    # 3. Собираем контекст из найденных чанков
+    # Собираем контекст
     context_chunks = results['documents'][0]
-    sources = []
-    all_links = []
-    for meta in results['metadatas'][0]:
-        src = meta.get('source', 'неизвестно')
-        sources.append(src)
-        links = meta.get('links', '')
-        if links:
-            all_links.extend(links.split(';'))
-
+    sources = list(set(meta['source'] for meta in results['metadatas'][0]))
     context_text = "\n\n".join(context_chunks)
 
-    # 4. Формируем промпт
+    # Промпт
     system_prompt = (
         "Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст. "
         "Если ответа нет в контексте, скажи, что не знаешь. Не добавляй информацию из своего знания.\n\n"
@@ -66,10 +121,9 @@ async def handle_message(update, context):
     )
     prompt = system_prompt.format(context=context_text, question=user_text)
 
-    # 5. Вызываем Groq
     try:
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",   # можно заменить на другую модель
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=1024
@@ -80,18 +134,14 @@ async def handle_message(update, context):
         await update.message.reply_text("Произошла ошибка при генерации ответа. Попробуйте позже.")
         return
 
-    # 6. Добавляем источники (имена файлов)
-    source_line = f"\n\n📄 Источники: {', '.join(set(sources))}"
+    source_line = f"\n\n📄 Источники: {', '.join(sources)}"
     final_answer = answer + source_line
-
-    # (Опционально) можно добавить ссылки, но мы пока не выводим их, а только используем для индексации
-    # Если нужно показать ссылки, раскомментируйте:
-    # if all_links:
-    #     final_answer += f"\n\n🔗 Ссылки: {', '.join(set(all_links))}"
-
     await update.message.reply_text(final_answer)
 
 def main():
+    # При запуске бота сразу проверяем коллекцию (индексируем, если нужно)
+    ensure_collection()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
