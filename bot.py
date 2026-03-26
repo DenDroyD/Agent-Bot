@@ -1,6 +1,8 @@
+import sys
 import os
 import logging
 import glob
+import traceback
 from dotenv import load_dotenv
 import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -10,23 +12,58 @@ from groq import Groq
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-load_dotenv()
+# Настройка логирования – выводим всё в stderr
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger(__name__)
+
+# Пишем сразу, что скрипт запустился
+print("🚀 Бот запускается...", file=sys.stderr)
+
+load_dotenv()  # попытка загрузить .env, если есть
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+if not TELEGRAM_TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN не задан")
+    sys.exit(1)
+if not GROQ_API_KEY:
+    logger.error("❌ GROQ_API_KEY не задан")
+    sys.exit(1)
+
+logger.info(f"✅ Токены получены: TELEGRAM_TOKEN={TELEGRAM_TOKEN[:5]}..., GROQ_API_KEY={GROQ_API_KEY[:5]}...")
 
 # Инициализация Groq
-groq_client = Groq(api_key=GROQ_API_KEY)
+try:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    logger.info("✅ Groq client создан")
+except Exception as e:
+    logger.error(f"❌ Ошибка создания Groq client: {e}")
+    sys.exit(1)
 
-# Конфигурация векторной БД и эмбеддера
+# Конфигурация векторной БД
 CHROMA_PATH = "./chroma_db"
 COLLECTION_NAME = "docs"
 DOCS_DIR = "documents"
 
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+try:
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    logger.info("✅ Chroma client создан")
+except Exception as e:
+    logger.error(f"❌ Ошибка создания Chroma client: {e}")
+    sys.exit(1)
+
+# Модель эмбеддингов
+try:
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    logger.info("✅ Модель эмбеддингов загружена")
+except Exception as e:
+    logger.error(f"❌ Ошибка загрузки модели эмбеддингов: {e}")
+    sys.exit(1)
+
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
     chunk_overlap=200,
@@ -48,27 +85,31 @@ def extract_text_and_links(html_path):
 
 def ensure_collection():
     """Проверяет существование коллекции, при отсутствии — создаёт и индексирует документы."""
+    logger.info("Проверяем коллекцию...")
     try:
         collection = chroma_client.get_collection(COLLECTION_NAME)
         logger.info("Коллекция уже существует")
         return collection
     except chromadb.errors.InvalidCollectionException:
-        logger.info("Коллекция не найдена, начинаем индексацию...")
+        logger.info("Коллекция не найдена, создаём новую")
         collection = chroma_client.create_collection(COLLECTION_NAME)
 
         # Индексируем все HTML-файлы в папке documents
         html_files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
         if not html_files:
-            logger.warning("Папка documents пуста, индексация не выполнена")
+            logger.warning(f"Папка {DOCS_DIR} пуста или не содержит HTML-файлов. Индексация не выполнена.")
             return collection
 
+        logger.info(f"Найдено {len(html_files)} HTML-файлов. Начинаем индексацию...")
         for file_path in html_files:
             logger.info(f"Индексируем {file_path}...")
             text, links = extract_text_and_links(file_path)
             if not text:
+                logger.warning(f"  В файле {file_path} не удалось извлечь текст.")
                 continue
             chunks = text_splitter.split_text(text)
             if not chunks:
+                logger.warning(f"  В файле {file_path} нет текста для чанков.")
                 continue
 
             embeddings = embedder.encode(chunks).tolist()
@@ -139,9 +180,15 @@ async def handle_message(update, context):
     await update.message.reply_text(final_answer)
 
 def main():
-    # При запуске бота сразу проверяем коллекцию (индексируем, если нужно)
-    ensure_collection()
+    try:
+        logger.info("Проверка коллекции перед запуском...")
+        ensure_collection()
+    except Exception as e:
+        logger.error(f"Ошибка при индексации: {e}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
+    logger.info("Создаём приложение Telegram...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
