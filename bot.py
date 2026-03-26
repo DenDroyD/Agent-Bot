@@ -4,47 +4,63 @@ import logging
 import glob
 import asyncio
 import threading
-from dotenv import load_dotenv
+from pathlib import Path
+# from dotenv import load_dotenv  # НЕ НУЖНО на bothost.ru - переменные задаются в панели
 import telegram
+from telegram import Update
 from flask import Flask, request
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 from bs4 import BeautifulSoup
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
-LOG_DIR = "/app/logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+# Очищаем старые handlers чтобы избежать дублирования
+root_logger = logging.getLogger()
+root_logger.handlers = []
 
 # Пишем логи и в stderr (видно в контейнере), и в файл
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stderr),   # для консоли Docker
-        logging.FileHandler(os.path.join(LOG_DIR, "bot.log"))
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(LOG_DIR / "bot.log", encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
 logger.info("🚀 Бот запускается...")
 
-# ========== ЗАГРУЗКА ПЕРЕМЕННЫХ ==========
-load_dotenv()
+# ========== ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
+# На bothost.ru переменные задаются в панели управления, файл .env не нужен
+# load_dotenv()  # ОТКЛЮЧЕНО - переменные уже доступны через os.getenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DOMAIN = os.getenv("DOMAIN")          # обязательно, например: bot.example.com
+DOMAIN = os.getenv("DOMAIN")          # обязательно, например: bot_1774520310_9336_dendroyd.bothost.tech
 PORT = int(os.getenv("PORT", "3000")) # порт, на котором слушает Flask
+
+# Детальное логирование для отладки
+logger.info(f"🔍 Проверка переменных окружения:")
+logger.info(f"   TELEGRAM_TOKEN: {'задан' if TELEGRAM_TOKEN else '❌ НЕ ЗАДАН'}")
+logger.info(f"   GROQ_API_KEY: {'задан' if GROQ_API_KEY else '❌ НЕ ЗАДАН'}")
+logger.info(f"   DOMAIN: {DOMAIN or '❌ НЕ ЗАДАН'}")
+logger.info(f"   PORT: {PORT}")
 
 # Проверки обязательных переменных
 if not TELEGRAM_TOKEN:
-    logger.error("❌ TELEGRAM_TOKEN не задан")
+    logger.error("❌ TELEGRAM_TOKEN не задан в панели управления bothost.ru")
     sys.exit(1)
 if not GROQ_API_KEY:
-    logger.error("❌ GROQ_API_KEY не задан")
+    logger.error("❌ GROQ_API_KEY не задан в панели управления bothost.ru")
     sys.exit(1)
 if not DOMAIN:
-    logger.error("❌ DOMAIN не задан (например, bot.example.com)")
+    logger.error("❌ DOMAIN не задан в панели управления bothost.ru (например, bot_1774520310_9336_dendroyd.bothost.tech)")
     sys.exit(1)
 
 logger.info(f"✅ Токены получены: TELEGRAM_TOKEN={TELEGRAM_TOKEN[:5]}..., GROQ_API_KEY={GROQ_API_KEY[:5]}...")
@@ -59,11 +75,11 @@ except Exception as e:
     logger.error(f"❌ Ошибка создания Groq client: {e}")
     sys.exit(1)
 
-# ChromaDB – используем абсолютные пути для надёжности
-CHROMA_PATH = "/app/chroma_db"
-DOCS_DIR = "/app/documents"
-os.makedirs(CHROMA_PATH, exist_ok=True)
-os.makedirs(DOCS_DIR, exist_ok=True)
+# ChromaDB – используем относительные пути для bothost.ru
+CHROMA_PATH = BASE_DIR / "chroma_db"
+DOCS_DIR = BASE_DIR / "documents"
+CHROMA_PATH.mkdir(exist_ok=True)
+DOCS_DIR.mkdir(exist_ok=True)
 
 try:
     chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -104,15 +120,17 @@ def extract_text_and_links(html_path):
 def ensure_collection():
     """Создаёт коллекцию ChromaDB и индексирует HTML-файлы из DOCS_DIR"""
     logger.info("Проверяем коллекцию...")
+    collection = None
     try:
         collection = chroma_client.get_collection("docs")
         logger.info("Коллекция уже существует")
         return collection
-    except chromadb.errors.InvalidCollectionException:
-        logger.info("Коллекция не найдена, создаём новую")
+    except Exception as e:
+        # В новых версиях chromadb используется NotFoundError вместо InvalidCollectionException
+        logger.info(f"Коллекция не найдена ({type(e).__name__}), создаём новую")
         collection = chroma_client.create_collection("docs")
 
-        html_files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
+        html_files = glob.glob(str(DOCS_DIR / "*.html"))
         if not html_files:
             logger.warning(f"Папка {DOCS_DIR} пуста или не содержит HTML-файлов. Индексация не выполнена.")
             return collection
@@ -130,7 +148,7 @@ def ensure_collection():
                 continue
 
             embeddings = embedder.encode(chunks).tolist()
-            file_name = os.path.basename(file_path)
+            file_name = Path(file_path).name
             ids = [f"{file_name}_{i}" for i in range(len(chunks))]
             metadatas = [{"source": file_name, "links": ";".join(links)} for _ in chunks]
 
@@ -219,7 +237,7 @@ asyncio.set_event_loop(loop)
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Точка входа для вебхука Telegram"""
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
+    update = Update.de_json(request.get_json(force=True), bot)
     # Запускаем асинхронную обработку в фоновом цикле
     asyncio.run_coroutine_threadsafe(handle_update(update), loop)
     return 'ok'
