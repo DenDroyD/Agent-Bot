@@ -5,25 +5,31 @@ import glob
 import traceback
 from dotenv import load_dotenv
 import telegram
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from flask import Flask, request
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# Настройка логирования – выводим всё в stderr
+# Папка для логов
+LOG_DIR = "/app/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Настройка логирования
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stderr)]
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(os.path.join(LOG_DIR, "bot.log"))
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Пишем сразу, что скрипт запустился
-print("🚀 Бот запускается...", file=sys.stderr)
+logger.info("🚀 Бот запускается...")
 
-load_dotenv()  # попытка загрузить .env, если есть
+load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -84,7 +90,6 @@ def extract_text_and_links(html_path):
         return text, list(set(links))
 
 def ensure_collection():
-    """Проверяет существование коллекции, при отсутствии — создаёт и индексирует документы."""
     logger.info("Проверяем коллекцию...")
     try:
         collection = chroma_client.get_collection(COLLECTION_NAME)
@@ -94,7 +99,6 @@ def ensure_collection():
         logger.info("Коллекция не найдена, создаём новую")
         collection = chroma_client.create_collection(COLLECTION_NAME)
 
-        # Индексируем все HTML-файлы в папке documents
         html_files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
         if not html_files:
             logger.warning(f"Папка {DOCS_DIR} пуста или не содержит HTML-файлов. Индексация не выполнена.")
@@ -126,75 +130,93 @@ def ensure_collection():
             logger.info(f"  Добавлено {len(chunks)} чанков, ссылок: {len(links)}")
         return collection
 
-async def start(update, context):
-    await update.message.reply_text("Привет! Я бот-помощник по документации. Задай вопрос, и я найду ответ в нашей базе знаний.")
+# Инициализируем коллекцию один раз при старте
+collection = ensure_collection()
 
-async def handle_message(update, context):
-    user_text = update.message.text
-    logger.info(f"Пользователь {update.effective_user.id}: {user_text}")
+# --- Flask приложение для вебхука ---
+app = Flask(__name__)
 
-    collection = ensure_collection()  # при каждом запросе проверяем, но коллекция уже существует
+# Обработчик вебхука
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # Получаем обновление от Telegram
+    update = telegram.Update.de_json(request.get_json(force=True), bot)
+    # Обрабатываем сообщение
+    asyncio.run(handle_update(update))
+    return 'ok'
 
-    # Эмбеддинг вопроса
-    query_embedding = embedder.encode([user_text]).tolist()[0]
+# Функция обработки обновления (асинхронная, как раньше)
+async def handle_update(update):
+    if update.message:
+        user_text = update.message.text
+        chat_id = update.message.chat_id
+        logger.info(f"Пользователь {update.effective_user.id}: {user_text}")
 
-    # Поиск
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=TOP_K,
-        include=["documents", "metadatas", "distances"]
-    )
-
-    if not results['documents'][0]:
-        await update.message.reply_text("Извините, не нашёл информации по вашему вопросу.")
-        return
-
-    # Собираем контекст
-    context_chunks = results['documents'][0]
-    sources = list(set(meta['source'] for meta in results['metadatas'][0]))
-    context_text = "\n\n".join(context_chunks)
-
-    # Промпт
-    system_prompt = (
-        "Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст. "
-        "Если ответа нет в контексте, скажи, что не знаешь. Не добавляй информацию из своего знания.\n\n"
-        "Контекст:\n{context}\n\nВопрос: {question}\n\nОтвет:"
-    )
-    prompt = system_prompt.format(context=context_text, question=user_text)
-
-    try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1024
+        # Поиск в коллекции
+        query_embedding = embedder.encode([user_text]).tolist()[0]
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=TOP_K,
+            include=["documents", "metadatas", "distances"]
         )
-        answer = completion.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Ошибка Groq: {e}")
-        await update.message.reply_text("Произошла ошибка при генерации ответа. Попробуйте позже.")
-        return
 
-    source_line = f"\n\n📄 Источники: {', '.join(sources)}"
-    final_answer = answer + source_line
-    await update.message.reply_text(final_answer)
+        if not results['documents'][0]:
+            await bot.send_message(chat_id, "Извините, не нашёл информации по вашему вопросу.")
+            return
 
-def main():
+        context_chunks = results['documents'][0]
+        sources = list(set(meta['source'] for meta in results['metadatas'][0]))
+        context_text = "\n\n".join(context_chunks)
+
+        system_prompt = (
+            "Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст. "
+            "Если ответа нет в контексте, скажи, что не знаешь. Не добавляй информацию из своего знания.\n\n"
+            "Контекст:\n{context}\n\nВопрос: {question}\n\nОтвет:"
+        )
+        prompt = system_prompt.format(context=context_text, question=user_text)
+
+        try:
+            completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1024
+            )
+            answer = completion.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Ошибка Groq: {e}")
+            await bot.send_message(chat_id, "Произошла ошибка при генерации ответа. Попробуйте позже.")
+            return
+
+        source_line = f"\n\n📄 Источники: {', '.join(sources)}"
+        final_answer = answer + source_line
+        await bot.send_message(chat_id, final_answer)
+
+# Создаём объект бота
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
+
+# Установка вебхука
+async def set_webhook():
+    # Определяем публичный URL вашего бота
+    # В переменной окружения DOMAIN будет ваш домен (например, bot1234.bothost.ru)
+    domain = os.getenv("DOMAIN")
+    if not domain:
+        logger.error("❌ Переменная DOMAIN не задана. Убедитесь, что домен включён в настройках бота.")
+        sys.exit(1)
+    webhook_url = f"https://{domain}/webhook"
     try:
-        logger.info("Проверка коллекции перед запуском...")
-        ensure_collection()
+        await bot.set_webhook(webhook_url)
+        logger.info(f"✅ Вебхук установлен: {webhook_url}")
     except Exception as e:
-        logger.error(f"Ошибка при индексации: {e}")
-        traceback.print_exc(file=sys.stderr)
+        logger.error(f"❌ Ошибка установки вебхука: {e}")
         sys.exit(1)
 
-    logger.info("Создаём приложение Telegram...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Бот запущен в режиме long polling")
-    app.run_polling(allowed_updates=telegram.Update.ALL_TYPES)
-
+# Запуск Flask
 if __name__ == "__main__":
-    main()
+    # Устанавливаем вебхук (только при первом запуске)
+    asyncio.run(set_webhook())
+
+    # Запускаем Flask-сервер
+    port = int(os.getenv("PORT", 3000))
+    logger.info(f"🚀 Запуск Flask на порту {port}")
+    app.run(host="0.0.0.0", port=port)
